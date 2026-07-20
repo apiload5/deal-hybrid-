@@ -1,0 +1,53 @@
+vercel-api/
+├── api/
+│   ├── auth/
+│   │   ├── login.js
+│   │   ├── register.js
+│   │   ├── google.js
+│   │   ├── reset-password.js
+│   │   ├── verify-email.js
+│   │   └── me.js
+│   ├── properties/
+│   │   ├── index.js
+│   │   ├── [id].js
+│   │   ├── featured.js
+│   │   └── premium.js
+│   ├── agencies/
+│   │   ├── index.js
+│   │   ├── [id].js
+│   │   └── agents.js
+│   ├── builders/
+│   │   ├── index.js
+│   │   ├── [id].js
+│   │   └── projects.js
+│   ├── projects/
+│   │   ├── index.js
+│   │   └── [id].js
+│   ├── videos/
+│   │   └── index.js
+│   ├── media/
+│   │   └── upload.js
+│   ├── wishlist/
+│   │   └── index.js
+│   ├── agent/
+│   │   ├── dashboard.js
+│   │   └── properties.js
+│   ├── admin/
+│   │   ├── dashboard.js
+│   │   ├── users.js
+│   │   └── verify.js
+│   ├── payment/
+│   │   ├── create.js
+│   │   └── webhook.js
+│   ├── cities.js
+│   ├── area-guides.js
+│   └── blog.js
+├── lib/
+│   ├── supabase.js
+│   ├── auth.js
+│   ├── cloudinary.js
+│   ├── rapidgateway.js
+│   └── email.js
+├── package.json
+├── vercel.json
+└── .env.example
