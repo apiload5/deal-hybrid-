@@ -1,0 +1,24 @@
+{
+  "name": "deal-pk-api",
+  "version": "1.0.0",
+  "description": "Deal.pk Backend API - Vercel Serverless",
+  "main": "api/index.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod",
+    "build": "echo 'No build step required'"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.49.1",
+    "bcryptjs": "2.4.3",
+    "jsonwebtoken": "9.0.2",
+    "cors": "2.8.5",
+    "dotenv": "16.4.7"
+  },
+  "devDependencies": {
+    "vercel": "37.14.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
