@@ -11,16 +11,5 @@
       "src": "/api/(.*)",
       "dest": "/api/$1"
     }
-  ],
-  "env": {
-    "SUPABASE_URL": "@supabase_url",
-    "SUPABASE_ANON_KEY": "@supabase_anon_key",
-    "SUPABASE_SERVICE_ROLE_KEY": "@supabase_service_role_key",
-    "JWT_SECRET": "@jwt_secret",
-    "RAPID_MERCHANT_ID": "@rapid_merchant_id",
-    "RAPID_API_KEY": "@rapid_api_key",
-    "RAPID_SECRET_KEY": "@rapid_secret_key",
-    "RESEND_API_KEY": "@resend_api_key",
-    "REDIRECT_URL": "@redirect_url"
-  }
+  ]
 }
