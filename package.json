@@ -2,9 +2,12 @@
   "name": "deal-pk-api",
   "version": "1.0.0",
   "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.0",
     "cloudinary": "^2.7.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^2.7.0"
   }
 }
