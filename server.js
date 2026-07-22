@@ -1,4 +1,4 @@
-// server.js - Complete Backend Server
+// server.js - Complete Backend Server with Admin Panel
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -24,6 +24,29 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // ============================================
+// AUTH HELPERS
+// ============================================
+async function verifyToken(token) {
+    try {
+        const { data: { user }, error } = await supabase.auth.getUser(token);
+        if (error) throw error;
+        return user;
+    } catch {
+        return null;
+    }
+}
+
+async function isAdmin(userId) {
+    const { data, error } = await supabase
+        .from('users')
+        .select('role')
+        .eq('id', userId)
+        .single();
+    if (error || !data) return false;
+    return data.role === 'admin';
+}
+
+// ============================================
 // HEALTH CHECK
 // ============================================
 app.get('/', (req, res) => {
@@ -37,7 +60,8 @@ app.get('/', (req, res) => {
             cities: '/api/cities',
             agencies: '/api/agencies',
             builders: '/api/builders',
-            projects: '/api/projects'
+            projects: '/api/projects',
+            admin: '/api/admin/dashboard, /api/admin/users, /api/admin/properties'
         }
     });
 });
@@ -144,7 +168,7 @@ app.post('/api/auth/register', async (req, res) => {
 // Get all properties
 app.get('/api/properties', async (req, res) => {
     try {
-        const { city, type, purpose, minPrice, maxPrice, beds, limit = 20, page = 1 } = req.query;
+        const { city, type, purpose, minPrice, maxPrice, beds, areaId, limit = 20, page = 1 } = req.query;
         const offset = (parseInt(page) - 1) * parseInt(limit);
 
         let query = supabase
@@ -160,6 +184,16 @@ app.get('/api/properties', async (req, res) => {
         if (minPrice) query = query.gte('price', parseInt(minPrice));
         if (maxPrice) query = query.lte('price', parseInt(maxPrice));
         if (beds) query = query.gte('beds', parseInt(beds));
+
+        // Area filter
+        if (areaId) {
+            const { data: area } = await supabase
+                .from('areas')
+                .select('name')
+                .eq('id', areaId)
+                .single();
+            if (area) query = query.eq('area', area.name);
+        }
 
         const { data, error, count } = await query;
 
@@ -191,7 +225,6 @@ app.get('/api/properties/:id', async (req, res) => {
     try {
         const { id } = req.params;
 
-        // Increment view count
         await supabase.rpc('increment_property_views', { property_id: id });
 
         const { data, error } = await supabase
@@ -566,10 +599,465 @@ app.get('/api/blog', async (req, res) => {
 });
 
 // ============================================
+// ADMIN PANEL ROUTES
+// ============================================
+
+// ADMIN DASHBOARD
+app.get('/api/admin/dashboard', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        // Get all stats
+        const [
+            { count: totalUsers },
+            { count: totalAgents },
+            { count: totalProperties },
+            { count: totalAgencies },
+            { count: totalBuilders },
+            { count: totalProjects },
+            { count: totalDeals },
+            { count: totalPayments },
+            { count: pendingProperties },
+        ] = await Promise.all([
+            supabase.from('users').select('*', { count: 'exact', head: true }),
+            supabase.from('agents').select('*', { count: 'exact', head: true }),
+            supabase.from('properties').select('*', { count: 'exact', head: true }),
+            supabase.from('agencies').select('*', { count: 'exact', head: true }),
+            supabase.from('builders').select('*', { count: 'exact', head: true }),
+            supabase.from('projects').select('*', { count: 'exact', head: true }),
+            supabase.from('deals').select('*', { count: 'exact', head: true }),
+            supabase.from('payments').select('*', { count: 'exact', head: true }),
+            supabase.from('properties').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
+        ]);
+
+        // Recent activities
+        const { data: recentProperties } = await supabase
+            .from('properties')
+            .select('*, users!owner_id(name)')
+            .order('created_at', { ascending: false })
+            .limit(10);
+
+        const { data: recentUsers } = await supabase
+            .from('users')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(10);
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                stats: {
+                    totalUsers: totalUsers || 0,
+                    totalAgents: totalAgents || 0,
+                    totalProperties: totalProperties || 0,
+                    totalAgencies: totalAgencies || 0,
+                    totalBuilders: totalBuilders || 0,
+                    totalProjects: totalProjects || 0,
+                    totalDeals: totalDeals || 0,
+                    totalPayments: totalPayments || 0,
+                    pendingProperties: pendingProperties || 0,
+                },
+                recentProperties: recentProperties || [],
+                recentUsers: recentUsers || [],
+            },
+        });
+    } catch (error) {
+        console.error('Admin dashboard error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ADMIN USERS
+app.get('/api/admin/users', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        const { limit = 50, page = 1 } = req.query;
+        const offset = (parseInt(page) - 1) * parseInt(limit);
+
+        const { data, error, count } = await supabase
+            .from('users')
+            .select('*, agents!user_id(*)', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(offset, offset + parseInt(limit) - 1);
+
+        if (error) {
+            return res.status(400).json({ success: false, error: error.message });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: data || [],
+            total: count || 0,
+            page: parseInt(page),
+            limit: parseInt(limit),
+        });
+    } catch (error) {
+        console.error('Admin users error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ADMIN UPDATE USER
+app.put('/api/admin/users/:id', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        const { id } = req.params;
+        const { role, isVerified } = req.body;
+
+        if (role) {
+            await supabase
+                .from('users')
+                .update({ role })
+                .eq('id', id);
+        }
+
+        if (isVerified !== undefined) {
+            await supabase
+                .from('agents')
+                .update({ verified: isVerified })
+                .eq('user_id', id);
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: 'User updated successfully',
+        });
+    } catch (error) {
+        console.error('Admin update user error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ADMIN DELETE USER
+app.delete('/api/admin/users/:id', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        const { id } = req.params;
+
+        await supabase
+            .from('users')
+            .update({ deleted_at: new Date().toISOString() })
+            .eq('id', id);
+
+        return res.status(200).json({
+            success: true,
+            message: 'User deleted successfully',
+        });
+    } catch (error) {
+        console.error('Admin delete user error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ADMIN PROPERTIES
+app.get('/api/admin/properties', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        const { status, limit = 50, page = 1 } = req.query;
+        const offset = (parseInt(page) - 1) * parseInt(limit);
+
+        let query = supabase
+            .from('properties')
+            .select('*, users!owner_id(name, email), agents!agent_id(company_name)', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(offset, offset + parseInt(limit) - 1);
+
+        if (status) query = query.eq('status', status);
+
+        const { data, error, count } = await query;
+
+        if (error) {
+            return res.status(400).json({ success: false, error: error.message });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: data || [],
+            total: count || 0,
+            page: parseInt(page),
+            limit: parseInt(limit),
+        });
+    } catch (error) {
+        console.error('Admin properties error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ADMIN UPDATE PROPERTY
+app.put('/api/admin/properties/:id', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        const { id } = req.params;
+        const { status, isFeatured, isPremium } = req.body;
+
+        const updateData = {};
+        if (status) updateData.status = status;
+        if (isFeatured !== undefined) updateData.is_featured = isFeatured;
+        if (isPremium !== undefined) updateData.is_premium = isPremium;
+
+        const { data, error } = await supabase
+            .from('properties')
+            .update(updateData)
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) {
+            return res.status(400).json({ success: false, error: error.message });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data,
+            message: 'Property updated successfully',
+        });
+    } catch (error) {
+        console.error('Admin update property error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ADMIN AGENCIES
+app.get('/api/admin/agencies', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        const { limit = 50, page = 1 } = req.query;
+        const offset = (parseInt(page) - 1) * parseInt(limit);
+
+        const { data, error, count } = await supabase
+            .from('agencies')
+            .select('*, users!owner_id(name, email)', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(offset, offset + parseInt(limit) - 1);
+
+        if (error) {
+            return res.status(400).json({ success: false, error: error.message });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: data || [],
+            total: count || 0,
+            page: parseInt(page),
+            limit: parseInt(limit),
+        });
+    } catch (error) {
+        console.error('Admin agencies error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ADMIN BUILDERS
+app.get('/api/admin/builders', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        const { limit = 50, page = 1 } = req.query;
+        const offset = (parseInt(page) - 1) * parseInt(limit);
+
+        const { data, error, count } = await supabase
+            .from('builders')
+            .select('*, users!owner_id(name, email)', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(offset, offset + parseInt(limit) - 1);
+
+        if (error) {
+            return res.status(400).json({ success: false, error: error.message });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: data || [],
+            total: count || 0,
+            page: parseInt(page),
+            limit: parseInt(limit),
+        });
+    } catch (error) {
+        console.error('Admin builders error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ADMIN VERIFY AGENCY/AGENT/BUILDER
+app.post('/api/admin/verify', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const user = await verifyToken(token);
+        if (!user) {
+            return res.status(401).json({ success: false, error: 'Invalid token' });
+        }
+
+        const adminCheck = await isAdmin(user.id);
+        if (!adminCheck) {
+            return res.status(403).json({ success: false, error: 'Admin access required' });
+        }
+
+        const { type, id, action } = req.body;
+
+        let tableName;
+        if (type === 'agency') tableName = 'agencies';
+        else if (type === 'builder') tableName = 'builders';
+        else if (type === 'agent') tableName = 'agents';
+        else {
+            return res.status(400).json({ success: false, error: 'Invalid type' });
+        }
+
+        const updateData = {
+            is_verified: action === 'verify',
+            status: action === 'verify' ? 'active' : 'rejected',
+        };
+
+        const { data, error } = await supabase
+            .from(tableName)
+            .update(updateData)
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) {
+            return res.status(400).json({ success: false, error: error.message });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: `${type} ${action === 'verify' ? 'verified' : 'rejected'} successfully`,
+            data,
+        });
+    } catch (error) {
+        console.error('Admin verify error:', error);
+        return res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+});
+
+// ============================================
 // START SERVER
 // ============================================
 app.listen(PORT, () => {
     console.log(`🚀 Deal.pk API Server running on port ${PORT}`);
     console.log(`📍 http://localhost:${PORT}`);
     console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`\n📋 Admin Panel Endpoints:`);
+    console.log(`  GET    /api/admin/dashboard    - Admin Dashboard`);
+    console.log(`  GET    /api/admin/users        - All Users`);
+    console.log(`  PUT    /api/admin/users/:id    - Update User`);
+    console.log(`  DELETE /api/admin/users/:id    - Delete User`);
+    console.log(`  GET    /api/admin/properties   - All Properties`);
+    console.log(`  PUT    /api/admin/properties/:id - Update Property`);
+    console.log(`  GET    /api/admin/agencies     - All Agencies`);
+    console.log(`  GET    /api/admin/builders     - All Builders`);
+    console.log(`  POST   /api/admin/verify       - Verify Agency/Agent/Builder`);
 });
