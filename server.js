@@ -1,1063 +1,292 @@
-// server.js - Complete Backend Server with Admin Panel
+// index.js - Deal.pk Complete Backend v5.0 with Cloudinary + RapidPaisa
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
+import { v2 as cloudinary } from 'cloudinary';
+import crypto from 'crypto';
+import axios from 'axios';
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 
 // ============================================
 // MIDDLEWARE
 // ============================================
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: '*', credentials: true }));
+app.use(express.json({ limit: '50mb' })); // for base64 images
 app.use(express.urlencoded({ extended: true }));
+
+// ============================================
+// CLOUDINARY CONFIG
+// ============================================
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 // ============================================
 // SUPABASE CLIENT
 // ============================================
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+    realtime: { transport: ws }
+});
 
 // ============================================
 // AUTH HELPERS
 // ============================================
 async function verifyToken(token) {
-    try {
-        const { data: { user }, error } = await supabase.auth.getUser(token);
-        if (error) throw error;
-        return user;
-    } catch {
-        return null;
-    }
+    try { const { data: { user } = await supabase.auth.getUser(token); return user; }
+    catch { return null; }
 }
-
-async function isAdmin(userId) {
-    const { data, error } = await supabase
-        .from('users')
-        .select('role')
-        .eq('id', userId)
-        .single();
-    if (error || !data) return false;
-    return data.role === 'admin';
+async function getUserRole(userId) {
+    const { data } = await supabase.from('users').select('role').eq('id', userId).single();
+    return data?.role || 'user';
 }
-
-// ============================================
-// HEALTH CHECK
-// ============================================
-app.get('/', (req, res) => {
-    res.json({
-        success: true,
-        message: 'Deal.pk API Server Running',
-        version: '2.0.0',
-        endpoints: {
-            auth: '/api/auth/login, /api/auth/register',
-            properties: '/api/properties',
-            cities: '/api/cities',
-            agencies: '/api/agencies',
-            builders: '/api/builders',
-            projects: '/api/projects',
-            admin: '/api/admin/dashboard, /api/admin/users, /api/admin/properties'
-        }
+async function authMiddleware(req, res, next) {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    const user = await verifyToken(token);
+    if (!user) return res.status(401).json({ success: false, error: 'Invalid token' });
+    req.user = user;
+    next();
+}
+async function adminMiddleware(req, res, next) {
+    await authMiddleware(req, res, async () => {
+        const role = await getUserRole(req.user.id);
+        if (role!== 'admin') return res.status(403).json({ success: false, error: 'Admin access required' });
+        next();
     });
+}
+
+// ============================================
+// CLOUDINARY UPLOAD API
+// ============================================
+app.post('/api/upload/image', authMiddleware, async (req, res) => {
+    try {
+        const { image, folder = 'dealpk' } = req.body; // image = base64 string
+        if (!image) return res.status(400).json({ success: false, error: 'No image provided' });
+
+        const result = await cloudinary.uploader.upload(image, {
+            folder: folder,
+            resource_type: 'auto'
+        });
+        res.json({ success: true, url: result.secure_url, public_id: result.public_id });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.delete('/api/upload/image', authMiddleware, async (req, res) => {
+    try {
+        const { public_id } = req.body;
+        await cloudinary.uploader.destroy(public_id);
+        res.json({ success: true, message: 'Image deleted' });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
 // ============================================
 // AUTH ROUTES
 // ============================================
-
-// Login
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { email, password, name, phone, roleType, agency_id } = req.body;
+        const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { name, phone, role: roleType } });
+        if (error) throw error;
+        if (data.user) {
+            await supabase.from('users').insert([{ id: data.user.id, email, name, phone, role: roleType }]);
+            if (roleType === 'agency') await supabase.from('agencies').insert([{ owner_id: data.user.id, name, email, phone, status: 'pending', is_premium: false }]);
+            if (roleType === 'builder') await supabase.from('builders').insert([{ owner_id: data.user.id, name, email, phone, status: 'pending', is_premium: false }]);
+            if (roleType === 'agent') await supabase.from('agents').insert([{ user_id: data.user.id, agency_id, status: 'pending', is_premium: false }]);
+        }
+        res.status(201).json({ success: true, message: 'Registration successful!', user: data.user });
+    } catch (error) { res.status(400).json({ success: false, error: error.message }); }
+});
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        
-        if (!email || !password) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Email and password are required' 
-            });
-        }
-
-        const { data, error } = await supabase.auth.signInWithPassword({
-            email,
-            password,
-        });
-
-        if (error) {
-            return res.status(401).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            user: data.user,
-            session: data.session,
-        });
-    } catch (error) {
-        console.error('Login error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// Register
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { email, password, name, phone } = req.body;
-
-        if (!email || !password || !name) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Email, password, and name are required' 
-            });
-        }
-
-        const { data, error } = await supabase.auth.signUp({
-            email,
-            password,
-            options: {
-                data: { name, phone: phone || '', role: 'user' },
-            },
-        });
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        if (data.user) {
-            await supabase
-                .from('users')
-                .insert([{
-                    id: data.user.id,
-                    email: data.user.email,
-                    name: name,
-                    phone: phone || '',
-                    role: 'user',
-                }]);
-        }
-
-        return res.status(201).json({
-            success: true,
-            message: 'Registration successful!',
-            user: data.user,
-        });
-    } catch (error) {
-        console.error('Registration error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        const { data: profile } = await supabase.from('users').select('*').eq('id', data.user.id).single();
+        res.json({ success: true, user: {...data.user, profile }, session: data.session });
+    } catch (error) { res.status(401).json({ success: false, error: error.message }); }
 });
 
 // ============================================
-// PROPERTIES ROUTES
+// PROFILE ROUTES - USER / AGENCY / BUILDER / AGENT
 // ============================================
+app.get('/api/user/profile', authMiddleware, async (req, res) => {
+    const { data } = await supabase.from('users').select('*').eq('id', req.user.id).single();
+    res.json({ success: true, data });
+});
+app.put('/api/user/profile', authMiddleware, async (req, res) => {
+    const { data } = await supabase.from('users').update(req.body).eq('id', req.user.id).select().single();
+    res.json({ success: true, data });
+});
+app.get('/api/agency/:id', async (req, res) => {
+    const { data } = await supabase.from('agencies').select('*, users!owner_id(*)').eq('id', req.params.id).single();
+    const { data: agents } = await supabase.from('agents').select('*, users!user_id(*)').eq('agency_id', req.params.id);
+    res.json({ success: true, data: {...data, agents } });
+});
+app.put('/api/agency/profile', authMiddleware, async (req, res) => {
+    const { data: agency } = await supabase.from('agencies').select('id').eq('owner_id', req.user.id).single();
+    const { data } = await supabase.from('agencies').update(req.body).eq('id', agency.id).select().single();
+    res.json({ success: true, data });
+});
+app.get('/api/builder/:id', async (req, res) => {
+    const { data } = await supabase.from('builders').select('*, users!owner_id(*)').eq('id', req.params.id).single();
+    res.json({ success: true, data });
+});
+app.put('/api/builder/profile', authMiddleware, async (req, res) => {
+    const { data: builder } = await supabase.from('builders').select('id').eq('owner_id', req.user.id).single();
+    const { data } = await supabase.from('builders').update(req.body).eq('id', builder.id).select().single();
+    res.json({ success: true, data });
+});
+app.get('/api/agent/:id', async (req, res) => {
+    const { data } = await supabase.from('agents').select('*, users!user_id(*), agencies!agency_id(*)').eq('id', req.params.id).single();
+    res.json({ success: true, data });
+});
+app.put('/api/agent/profile', authMiddleware, async (req, res) => {
+    const { data: agent } = await supabase.from('agents').select('id').eq('user_id', req.user.id).single();
+    const { data } = await supabase.from('agents').update(req.body).eq('id', agent.id).select().single();
+    res.json({ success: true, data });
+});
 
-// Get all properties
+// ============================================
+// PROPERTIES
+// ============================================
 app.get('/api/properties', async (req, res) => {
-    try {
-        const { city, type, purpose, minPrice, maxPrice, beds, areaId, limit = 20, page = 1 } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
-
-        let query = supabase
-            .from('properties')
-            .select('*, users!owner_id(name, phone, email)', { count: 'exact' })
-            .eq('status', 'approved')
-            .order('created_at', { ascending: false })
-            .range(offset, offset + parseInt(limit) - 1);
-
-        if (city) query = query.eq('city', city);
-        if (type) query = query.eq('property_type', type);
-        if (purpose) query = query.eq('purpose', purpose);
-        if (minPrice) query = query.gte('price', parseInt(minPrice));
-        if (maxPrice) query = query.lte('price', parseInt(maxPrice));
-        if (beds) query = query.gte('beds', parseInt(beds));
-
-        // Area filter
-        if (areaId) {
-            const { data: area } = await supabase
-                .from('areas')
-                .select('name')
-                .eq('id', areaId)
-                .single();
-            if (area) query = query.eq('area', area.name);
-        }
-
-        const { data, error, count } = await query;
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-            total: count || 0,
-            page: parseInt(page),
-            limit: parseInt(limit),
-        });
-    } catch (error) {
-        console.error('GET properties error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
+    const { city, type, purpose, minPrice, maxPrice, beds, limit = 20, page = 1 } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    let query = supabase.from('properties').select('*, users!owner_id(id, name, phone)', { count: 'exact' }).eq('status', 'approved');
+    if (city) query = query.eq('city', city);
+    if (type) query = query.eq('property_type', type);
+    if (purpose) query = query.eq('purpose', purpose);
+    if (minPrice) query = query.gte('price', minPrice);
+    if (maxPrice) query = query.lte('price', maxPrice);
+    if (beds) query = query.gte('beds', beds);
+    query = query.order('is_premium', { ascending: false }).order('created_at', { ascending: false }).range(offset, offset + parseInt(limit) - 1);
+    const { data, error, count } = await query;
+    res.json({ success: true, data, total: count });
 });
-
-// Get single property
 app.get('/api/properties/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        await supabase.rpc('increment_property_views', { property_id: id });
-
-        const { data, error } = await supabase
-            .from('properties')
-            .select(`
-                *,
-                users!owner_id(name, phone, email, image),
-                agents!agent_id(
-                    id,
-                    company_name,
-                    phone,
-                    rating,
-                    total_deals_completed,
-                    verified,
-                    users!user_id(name, email)
-                ),
-                reviews(
-                    id,
-                    rating,
-                    comment,
-                    created_at,
-                    users!user_id(name)
-                )
-            `)
-            .eq('id', id)
-            .single();
-
-        if (error) {
-            return res.status(404).json({ 
-                success: false, 
-                error: 'Property not found' 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data,
-        });
-    } catch (error) {
-        console.error('GET property error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
+    const { data } = await supabase.from('properties').select(`*, users!owner_id(*)`).eq('id', req.params.id).single();
+    res.json({ success: true, data });
+});
+app.post('/api/properties', authMiddleware, async (req, res) => {
+    const role = await getUserRole(req.user.id);
+    const status = (role === 'agent' || role === 'admin')? 'approved' : 'pending';
+    const { data } = await supabase.from('properties').insert([{...req.body, owner_id: req.user.id, status }]).select().single();
+    res.status(201).json({ success: true, data });
+});
+app.post('/api/properties/:id/video', authMiddleware, async (req, res) => {
+    const { video_url, video_type } = req.body;
+    const { data } = await supabase.from('properties').update({ video_url, video_type }).eq('id', req.params.id).select().single();
+    res.json({ success: true, data });
 });
 
 // ============================================
-// CITIES ROUTES
+// WISHLIST / CITIES / AGENCIES / BUILDERS / PROJECTS / BLOG
 // ============================================
-
-app.get('/api/cities', async (req, res) => {
-    try {
-        const { data, error } = await supabase
-            .from('cities')
-            .select('*, areas!city_id(id, name, slug, lat, lng)')
-            .order('name');
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-        });
-    } catch (error) {
-        console.error('Cities error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
+app.get('/api/wishlist', authMiddleware, async (req, res) => {
+    const { data } = await supabase.from('favorites').select('*, properties!property_id(*)').eq('user_id', req.user.id);
+    res.json({ success: true, data: data.map(i => i.properties) });
 });
-
-// Get areas by city
-app.get('/api/cities/:id/areas', async (req, res) => {
-    try {
-        const { id } = req.params;
-        
-        const { data, error } = await supabase
-            .from('areas')
-            .select('*')
-            .eq('city_id', id)
-            .order('name');
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-        });
-    } catch (error) {
-        console.error('Areas error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
+app.post('/api/wishlist', authMiddleware, async (req, res) => {
+    const { data } = await supabase.from('favorites').insert([{ user_id: req.user.id, property_id: req.body.propertyId }]).select().single();
+    res.json({ success: true, data });
 });
+app.delete('/api/wishlist', authMiddleware, async (req, res) => {
+    await supabase.from('favorites').delete().eq('user_id', req.user.id).eq('property_id', req.body.propertyId);
+    res.json({ success: true });
+});
+app.get('/api/cities', async (req, res) => { const { data } = await supabase.from('cities').select('*, areas!city_id(*)'); res.json({ success: true, data }); });
+app.get('/api/agencies', async (req, res) => { const { data } = await supabase.from('agencies').select('*').eq('status', 'active'); res.json({ success: true, data }); });
+app.get('/api/builders', async (req, res) => { const { data } = await supabase.from('builders').select('*').eq('status', 'active'); res.json({ success: true, data }); });
+app.get('/api/projects', async (req, res) => { const { data } = await supabase.from('projects').select('*, builders!builder_id(*), agencies!agency_id(*)'); res.json({ success: true, data }); });
+app.get('/api/blog', async (req, res) => { const { data } = await supabase.from('blogs').select('*').order('created_at', { ascending: false }).limit(9); res.json({ success: true, data }); });
+app.get('/api/area-guides', async (req, res) => { const { data } = await supabase.from('area_guides').select('*'); res.json({ success: true, data }); });
+app.post('/api/admin/area-guide', adminMiddleware, async (req, res) => { const { data } = await supabase.from('area_guides').insert([req.body]).select().single(); res.json({ success: true, data }); });
 
 // ============================================
-// AREAS ROUTES
+// RAPIDPAISA PAYMENT INTEGRATION
 // ============================================
+const RAPIDPAISA_MERCHANT_ID = process.env.RAPIDPAISA_MERCHANT_ID;
+const RAPIDPAISA_SECRET_KEY = process.env.RAPIDPAISA_SECRET_KEY;
+const RAPIDPAISA_URL = 'https://app.rapidpaisa.com/api/payment'; // check their docs
 
-app.get('/api/areas', async (req, res) => {
+app.post('/api/payment/create-premium', authMiddleware, async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('areas')
-            .select('*, cities!city_id(name)')
-            .order('name');
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-        });
-    } catch (error) {
-        console.error('Areas error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// ============================================
-// AGENCIES ROUTES
-// ============================================
-
-app.get('/api/agencies', async (req, res) => {
-    try {
-        const { city, limit = 20, page = 1 } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
-
-        let query = supabase
-            .from('agencies')
-            .select('*, users!owner_id(name, email, phone)', { count: 'exact' })
-            .order('created_at', { ascending: false })
-            .range(offset, offset + parseInt(limit) - 1);
-
-        if (city) query = query.eq('city', city);
-
-        const { data, error, count } = await query;
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-            total: count || 0,
-            page: parseInt(page),
-            limit: parseInt(limit),
-        });
-    } catch (error) {
-        console.error('Agencies error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// ============================================
-// BUILDERS ROUTES
-// ============================================
-
-app.get('/api/builders', async (req, res) => {
-    try {
-        const { city, limit = 20, page = 1 } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
-
-        let query = supabase
-            .from('builders')
-            .select('*, users!owner_id(name, email, phone)', { count: 'exact' })
-            .order('created_at', { ascending: false })
-            .range(offset, offset + parseInt(limit) - 1);
-
-        if (city) query = query.eq('city', city);
-
-        const { data, error, count } = await query;
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-            total: count || 0,
-            page: parseInt(page),
-            limit: parseInt(limit),
-        });
-    } catch (error) {
-        console.error('Builders error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// ============================================
-// PROJECTS ROUTES
-// ============================================
-
-app.get('/api/projects', async (req, res) => {
-    try {
-        const { city, type, status, limit = 20, page = 1 } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
-
-        let query = supabase
-            .from('projects')
-            .select('*, builders!builder_id(name, logo), agencies!agency_id(name, logo)', { count: 'exact' })
-            .order('created_at', { ascending: false })
-            .range(offset, offset + parseInt(limit) - 1);
-
-        if (city) query = query.eq('city', city);
-        if (type) query = query.eq('project_type', type);
-        if (status) query = query.eq('status', status);
-
-        const { data, error, count } = await query;
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-            total: count || 0,
-            page: parseInt(page),
-            limit: parseInt(limit),
-        });
-    } catch (error) {
-        console.error('Projects error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// ============================================
-// AREA GUIDES
-// ============================================
-
-app.get('/api/area-guides', async (req, res) => {
-    try {
-        const areaGuides = [
-            {
-                city: 'Islamabad',
-                description: 'The capital city of Pakistan, known for its beautiful landscapes and modern infrastructure.',
-                areas: ['DHA Phase 1-8', 'Bahria Town', 'F-6', 'F-7', 'F-8', 'G-10', 'Blue Area'],
-                averagePrice: 'Rs 35,000,000',
-                image: 'https://placehold.co/600x400/1a1a2e/ffffff?text=Islamabad',
-            },
-            {
-                city: 'Karachi',
-                description: 'The economic hub of Pakistan, offering diverse property options for all budgets.',
-                areas: ['DHA Phase 1-8', 'Clifton', 'Defence View', 'Bahria Town Karachi'],
-                averagePrice: 'Rs 25,000,000',
-                image: 'https://placehold.co/600x400/1a1a2e/ffffff?text=Karachi',
-            },
-            {
-                city: 'Lahore',
-                description: 'The cultural heart of Pakistan, rich in history and modern development.',
-                areas: ['DHA Phase 1-9', 'Gulberg', 'Model Town', 'Johar Town', 'Bahria Town'],
-                averagePrice: 'Rs 28,000,000',
-                image: 'https://placehold.co/600x400/1a1a2e/ffffff?text=Lahore',
-            },
-            {
-                city: 'Rawalpindi',
-                description: 'A bustling city with a rich history and growing real estate market.',
-                areas: ['Bahria Town Rawalpindi', 'DHA Phase 1-5', 'Gulraiz', 'Saddar'],
-                averagePrice: 'Rs 20,000,000',
-                image: 'https://placehold.co/600x400/1a1a2e/ffffff?text=Rawalpindi',
-            },
-            {
-                city: 'Faisalabad',
-                description: 'The industrial heart of Pakistan with a growing property market.',
-                areas: ['DHA Faisalabad', 'Gulberg', 'Madina Town'],
-                averagePrice: 'Rs 15,000,000',
-                image: 'https://placehold.co/600x400/1a1a2e/ffffff?text=Faisalabad',
-            },
-            {
-                city: 'Multan',
-                description: 'A historic city with modern development and affordable living.',
-                areas: ['DHA Multan', 'City Housing', 'Gulgasht', 'Bosan Road'],
-                averagePrice: 'Rs 12,000,000',
-                image: 'https://placehold.co/600x400/1a1a2e/ffffff?text=Multan',
-            },
-        ];
-
-        return res.status(200).json({
-            success: true,
-            data: areaGuides,
-        });
-    } catch (error) {
-        console.error('Area guides error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// ============================================
-// BLOG ROUTES
-// ============================================
-
-app.get('/api/blog', async (req, res) => {
-    try {
-        const { slug, limit = 9 } = req.query;
-
-        let query = supabase
-            .from('blogs')
-            .select('*, users!author_id(name, email)')
-            .order('created_at', { ascending: false });
-
-        if (slug) {
-            query = query.eq('slug', slug).single();
-        } else {
-            query = query.limit(parseInt(limit));
-        }
-
-        const { data, error } = await query;
-
-        if (error) {
-            return res.status(400).json({ 
-                success: false, 
-                error: error.message 
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-        });
-    } catch (error) {
-        console.error('Blog error:', error);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
-});
-
-// ============================================
-// ADMIN PANEL ROUTES
-// ============================================
-
-// ADMIN DASHBOARD
-app.get('/api/admin/dashboard', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        // Get all stats
-        const [
-            { count: totalUsers },
-            { count: totalAgents },
-            { count: totalProperties },
-            { count: totalAgencies },
-            { count: totalBuilders },
-            { count: totalProjects },
-            { count: totalDeals },
-            { count: totalPayments },
-            { count: pendingProperties },
-        ] = await Promise.all([
-            supabase.from('users').select('*', { count: 'exact', head: true }),
-            supabase.from('agents').select('*', { count: 'exact', head: true }),
-            supabase.from('properties').select('*', { count: 'exact', head: true }),
-            supabase.from('agencies').select('*', { count: 'exact', head: true }),
-            supabase.from('builders').select('*', { count: 'exact', head: true }),
-            supabase.from('projects').select('*', { count: 'exact', head: true }),
-            supabase.from('deals').select('*', { count: 'exact', head: true }),
-            supabase.from('payments').select('*', { count: 'exact', head: true }),
-            supabase.from('properties').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
-        ]);
-
-        // Recent activities
-        const { data: recentProperties } = await supabase
-            .from('properties')
-            .select('*, users!owner_id(name)')
-            .order('created_at', { ascending: false })
-            .limit(10);
-
-        const { data: recentUsers } = await supabase
-            .from('users')
-            .select('*')
-            .order('created_at', { ascending: false })
-            .limit(10);
-
-        return res.status(200).json({
-            success: true,
-            data: {
-                stats: {
-                    totalUsers: totalUsers || 0,
-                    totalAgents: totalAgents || 0,
-                    totalProperties: totalProperties || 0,
-                    totalAgencies: totalAgencies || 0,
-                    totalBuilders: totalBuilders || 0,
-                    totalProjects: totalProjects || 0,
-                    totalDeals: totalDeals || 0,
-                    totalPayments: totalPayments || 0,
-                    pendingProperties: pendingProperties || 0,
-                },
-                recentProperties: recentProperties || [],
-                recentUsers: recentUsers || [],
-            },
-        });
-    } catch (error) {
-        console.error('Admin dashboard error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ADMIN USERS
-app.get('/api/admin/users', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        const { limit = 50, page = 1 } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
-
-        const { data, error, count } = await supabase
-            .from('users')
-            .select('*, agents!user_id(*)', { count: 'exact' })
-            .order('created_at', { ascending: false })
-            .range(offset, offset + parseInt(limit) - 1);
-
-        if (error) {
-            return res.status(400).json({ success: false, error: error.message });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-            total: count || 0,
-            page: parseInt(page),
-            limit: parseInt(limit),
-        });
-    } catch (error) {
-        console.error('Admin users error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ADMIN UPDATE USER
-app.put('/api/admin/users/:id', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        const { id } = req.params;
-        const { role, isVerified } = req.body;
-
-        if (role) {
-            await supabase
-                .from('users')
-                .update({ role })
-                .eq('id', id);
-        }
-
-        if (isVerified !== undefined) {
-            await supabase
-                .from('agents')
-                .update({ verified: isVerified })
-                .eq('user_id', id);
-        }
-
-        return res.status(200).json({
-            success: true,
-            message: 'User updated successfully',
-        });
-    } catch (error) {
-        console.error('Admin update user error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ADMIN DELETE USER
-app.delete('/api/admin/users/:id', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        const { id } = req.params;
-
-        await supabase
-            .from('users')
-            .update({ deleted_at: new Date().toISOString() })
-            .eq('id', id);
-
-        return res.status(200).json({
-            success: true,
-            message: 'User deleted successfully',
-        });
-    } catch (error) {
-        console.error('Admin delete user error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ADMIN PROPERTIES
-app.get('/api/admin/properties', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        const { status, limit = 50, page = 1 } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
-
-        let query = supabase
-            .from('properties')
-            .select('*, users!owner_id(name, email), agents!agent_id(company_name)', { count: 'exact' })
-            .order('created_at', { ascending: false })
-            .range(offset, offset + parseInt(limit) - 1);
-
-        if (status) query = query.eq('status', status);
-
-        const { data, error, count } = await query;
-
-        if (error) {
-            return res.status(400).json({ success: false, error: error.message });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-            total: count || 0,
-            page: parseInt(page),
-            limit: parseInt(limit),
-        });
-    } catch (error) {
-        console.error('Admin properties error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ADMIN UPDATE PROPERTY
-app.put('/api/admin/properties/:id', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        const { id } = req.params;
-        const { status, isFeatured, isPremium } = req.body;
-
-        const updateData = {};
-        if (status) updateData.status = status;
-        if (isFeatured !== undefined) updateData.is_featured = isFeatured;
-        if (isPremium !== undefined) updateData.is_premium = isPremium;
-
-        const { data, error } = await supabase
-            .from('properties')
-            .update(updateData)
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (error) {
-            return res.status(400).json({ success: false, error: error.message });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data,
-            message: 'Property updated successfully',
-        });
-    } catch (error) {
-        console.error('Admin update property error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ADMIN AGENCIES
-app.get('/api/admin/agencies', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        const { limit = 50, page = 1 } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
-
-        const { data, error, count } = await supabase
-            .from('agencies')
-            .select('*, users!owner_id(name, email)', { count: 'exact' })
-            .order('created_at', { ascending: false })
-            .range(offset, offset + parseInt(limit) - 1);
-
-        if (error) {
-            return res.status(400).json({ success: false, error: error.message });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-            total: count || 0,
-            page: parseInt(page),
-            limit: parseInt(limit),
-        });
-    } catch (error) {
-        console.error('Admin agencies error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ADMIN BUILDERS
-app.get('/api/admin/builders', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        const { limit = 50, page = 1 } = req.query;
-        const offset = (parseInt(page) - 1) * parseInt(limit);
-
-        const { data, error, count } = await supabase
-            .from('builders')
-            .select('*, users!owner_id(name, email)', { count: 'exact' })
-            .order('created_at', { ascending: false })
-            .range(offset, offset + parseInt(limit) - 1);
-
-        if (error) {
-            return res.status(400).json({ success: false, error: error.message });
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: data || [],
-            total: count || 0,
-            page: parseInt(page),
-            limit: parseInt(limit),
-        });
-    } catch (error) {
-        console.error('Admin builders error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-});
-
-// ADMIN VERIFY AGENCY/AGENT/BUILDER
-app.post('/api/admin/verify', async (req, res) => {
-    try {
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ success: false, error: 'Unauthorized' });
-        }
-
-        const user = await verifyToken(token);
-        if (!user) {
-            return res.status(401).json({ success: false, error: 'Invalid token' });
-        }
-
-        const adminCheck = await isAdmin(user.id);
-        if (!adminCheck) {
-            return res.status(403).json({ success: false, error: 'Admin access required' });
-        }
-
-        const { type, id, action } = req.body;
-
-        let tableName;
-        if (type === 'agency') tableName = 'agencies';
-        else if (type === 'builder') tableName = 'builders';
-        else if (type === 'agent') tableName = 'agents';
-        else {
-            return res.status(400).json({ success: false, error: 'Invalid type' });
-        }
-
-        const updateData = {
-            is_verified: action === 'verify',
-            status: action === 'verify' ? 'active' : 'rejected',
+        const { type, id, duration, amount } = req.body; // amount in PKR
+        const order_id = `DEALPK-${Date.now()}`;
+
+        const payload = {
+            merchant_id: RAPIDPAISA_MERCHANT_ID,
+            order_id: order_id,
+            amount: amount,
+            currency: 'PKR',
+            customer_email: req.user.email,
+            customer_name: req.user.user_metadata?.name,
+            return_url: `${process.env.FRONTEND_URL}/payment/success`,
+            cancel_url: `${process.env.FRONTEND_URL}/payment/cancel`,
+            webhook_url: `${process.env.BACKEND_URL}/api/payment/webhook`
         };
 
-        const { data, error } = await supabase
-            .from(tableName)
-            .update(updateData)
-            .eq('id', id)
-            .select()
-            .single();
+        // Generate signature
+        const signature = crypto.createHmac('sha256', RAPIDPAISA_SECRET_KEY).update(JSON.stringify(payload)).digest('hex');
 
-        if (error) {
-            return res.status(400).json({ success: false, error: error.message });
+        // Save pending payment
+        await supabase.from('payments').insert([{
+            order_id, user_id: req.user.id, type, item_id: id, duration, amount, status: 'pending'
+        }]);
+
+        res.json({ success: true, payment_url: RAPIDPAISA_URL, payload, signature });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+// RapidPaisa Webhook - Payment success hone ke baad ye hit hoga
+app.post('/api/payment/webhook', async (req, res) => {
+    try {
+        const { order_id, status } = req.body;
+        if (status === 'success') {
+            const { data: payment } = await supabase.from('payments').select('*').eq('order_id', order_id).single();
+            if (payment) {
+                const table = payment.type + 's';
+                const expires = new Date(Date.now() + payment.duration * 24 * 60 * 60 * 1000);
+                await supabase.from(table).update({ is_premium: true, premium_expires_at: expires }).eq('id', payment.item_id);
+                await supabase.from('payments').update({ status: 'completed' }).eq('order_id', order_id);
+            }
         }
-
-        return res.status(200).json({
-            success: true,
-            message: `${type} ${action === 'verify' ? 'verified' : 'rejected'} successfully`,
-            data,
-        });
-    } catch (error) {
-        console.error('Admin verify error:', error);
-        return res.status(500).json({ success: false, error: 'Internal server error' });
-    }
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false }); }
 });
 
 // ============================================
-// START SERVER
+// ADMIN ROUTES
 // ============================================
-app.listen(PORT, () => {
-    console.log(`🚀 Deal.pk API Server running on port ${PORT}`);
-    console.log(`📍 http://localhost:${PORT}`);
-    console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`\n📋 Admin Panel Endpoints:`);
-    console.log(`  GET    /api/admin/dashboard    - Admin Dashboard`);
-    console.log(`  GET    /api/admin/users        - All Users`);
-    console.log(`  PUT    /api/admin/users/:id    - Update User`);
-    console.log(`  DELETE /api/admin/users/:id    - Delete User`);
-    console.log(`  GET    /api/admin/properties   - All Properties`);
-    console.log(`  PUT    /api/admin/properties/:id - Update Property`);
-    console.log(`  GET    /api/admin/agencies     - All Agencies`);
-    console.log(`  GET    /api/admin/builders     - All Builders`);
-    console.log(`  POST   /api/admin/verify       - Verify Agency/Agent/Builder`);
+app.get('/api/admin/dashboard', adminMiddleware, async (req, res) => {
+    const [users, properties] = await Promise.all([
+        supabase.from('users').select('*', { count: 'exact', head: true }),
+        supabase.from('properties').select('*', { count: 'exact', head: true })
+    ]);
+    res.json({ success: true, data: { stats: { totalUsers: users.count, totalProperties: properties.count } });
 });
+app.get('/api/admin/properties/pending', adminMiddleware, async (req, res) => {
+    const { data } = await supabase.from('properties').select('*, users!owner_id(name)').eq('status', 'pending');
+    res.json({ success: true, data });
+});
+app.post('/api/admin/property/approve', adminMiddleware, async (req, res) => {
+    const { id, action } = req.body;
+    const { data } = await supabase.from('properties').update({ status: action === 'approve'? 'approved' : 'rejected' }).eq('id', id).select().single();
+    res.json({ success: true, data });
+});
+app.post('/api/admin/verify', adminMiddleware, async (req, res) => {
+    const { type, id, action } = req.body;
+    const { data } = await supabase.from(type + 's').update({ status: action === 'verify'? 'active' : 'rejected' }).eq('id', id).select().single();
+    res.json({ success: true, data });
+});
+
+app.get('/', (req, res) => res.json({ success: true, message: 'Deal.pk API v5.0 Running' }));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
